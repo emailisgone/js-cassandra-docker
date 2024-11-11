@@ -11,29 +11,29 @@ const client = new cassandra.Client({
 });
 
 async function initDb(){
-    const createKeyspaceQuery = `
+    const createKeyspace = `
         CREATE KEYSPACE IF NOT EXISTS chatsystem 
         WITH REPLICATION = {
             'class': 'SimpleStrategy',
             'replication_factor': 2
         };
     `;
-    await client.execute(createKeyspaceQuery);
+    await client.execute(createKeyspace);
     await client.execute('USE chatsystem');
 
     /*await client.execute('DROP TABLE IF EXISTS channels');
     await client.execute('DROP TABLE IF EXISTS messages');*/
 
-    const createChannelTableQuery = `
+    const createChannelTable = `
         CREATE TABLE IF NOT EXISTS channels(
             id text PRIMARY KEY,
             owner text,
             topic text,
             members list<text>
         );`;
-    await client.execute(createChannelTableQuery);
+    await client.execute(createChannelTable);
 
-    const createMessagesTableQuery = `
+    const createMessagesTable = `
         CREATE TABLE IF NOT EXISTS messages(
             channelid text,
             timestamp timestamp,
@@ -41,7 +41,7 @@ async function initDb(){
             text text,
             PRIMARY KEY(channelid, timestamp)
         )WITH CLUSTERING ORDER BY (timestamp ASC);`;
-    await client.execute(createMessagesTableQuery);
+    await client.execute(createMessagesTable);
 }
 
 app.use(express.json());
@@ -111,6 +111,9 @@ app.delete('/channels/:channelId', async (req, res) => {
             message: "Channel not found."
         });
     }
+
+    const deleteMessagesQuery = 'DELETE FROM messages WHERE channelid = ?';
+    await client.execute(deleteMessagesQuery, [channelId], {prepare: true});
 
     const deleteQuery = 'DELETE FROM channels WHERE id = ?';
     await client.execute(deleteQuery, [channelId], {prepare: true});
@@ -193,7 +196,6 @@ app.delete('/channels/:channelId/members/:memberId', async (req, res) => {
     });
 });
 
-
 app.put('/channels/:channelId/messages', async (req, res) => {
     const {channelId} = req.params;
     const  {text, author} = req.body;
@@ -216,26 +218,81 @@ app.put('/channels/:channelId/messages', async (req, res) => {
 app.get('/channels/:channelId/messages', async (req, res) => {
     const {channelId} = req.params;
     const {startAt, author} = req.query;
-
     const parsedStartAt = startAt ? new Date(startAt) : null;
-    const query = parsedStartAt
-        ? 'SELECT timestamp, author, text FROM messages WHERE channelid = ? AND timestamp >= ?'
-        : 'SELECT timestamp, author, text FROM messages WHERE channelid = ?';
+    let tempTableName;
     
-    const params = parsedStartAt ? [channelId, parsedStartAt] : [channelId];
-    const result = await client.execute(query, params, {prepare: true});
-
-    let messages = result.rows.map(row => ({
-        text: row.text,
-        author: row.author,
-        timestamp: row.timestamp.toISOString()
-    }));
-
     if(author){
-        messages = messages.filter(msg => msg.author == author);
-    }
+        tempTableName = `tempMessages${Date.now()}`;
+        await client.execute(`
+            CREATE TABLE ${tempTableName} (
+                channelid text,
+                author text,
+                timestamp timestamp,
+                text text,
+                PRIMARY KEY ((channelid, author), timestamp)
+            ) WITH CLUSTERING ORDER BY (timestamp ASC)
+        `);
 
-    res.status(200).json(messages);
+        const selectQuery = 'SELECT channelid, author, timestamp, text FROM messages WHERE channelid = ?';
+        const selectResult = await client.execute(selectQuery, [channelId], {prepare: true});
+
+        if(selectResult.rows.length > 0){
+            const queries = selectResult.rows.map(row => ({
+                query: `INSERT INTO ${tempTableName} (channelid, author, timestamp, text) VALUES (?, ?, ?, ?)`,
+                params: [row.channelid, row.author, row.timestamp, row.text]
+            }));
+
+            await client.batch(queries, {prepare: true});
+        }
+
+        let query;
+        let params;
+        
+        if(parsedStartAt){
+            query = `
+                SELECT timestamp, author, text 
+                FROM ${tempTableName}
+                WHERE channelid = ? 
+                AND author = ? 
+                AND timestamp >= ?
+            `;
+            params = [channelId, author, parsedStartAt];
+        }else{
+            query = `
+                SELECT timestamp, author, text 
+                FROM ${tempTableName}
+                WHERE channelid = ? 
+                AND author = ?
+            `;
+            params = [channelId, author];
+        }
+        const result = await client.execute(query, params, {prepare: true});
+
+        await client.execute(`DROP TABLE IF EXISTS ${tempTableName}`);
+
+        const messages = result.rows.map(row => ({
+            text: row.text,
+            author: row.author,
+            timestamp: row.timestamp.toISOString()
+        }));
+
+        res.status(200).json(messages);
+    }else{
+        const query = parsedStartAt
+            ? 'SELECT timestamp, author, text FROM messages WHERE channelid = ? AND timestamp >= ?'
+            : 'SELECT timestamp, author, text FROM messages WHERE channelid = ?';
+        
+        const params = parsedStartAt ? [channelId, parsedStartAt] : [channelId];
+        const result = await client.execute(query, params, {prepare: true});
+
+        const messages = result.rows.map(row => ({
+            text: row.text,
+            author: row.author,
+            timestamp: row.timestamp.toISOString()
+        }));
+
+        res.status(200).json(messages);
+    }
 });
 
 app.listen(PORT, () => {
