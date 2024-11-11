@@ -42,6 +42,16 @@ async function initDb(){
             PRIMARY KEY(channelid, timestamp)
         )WITH CLUSTERING ORDER BY (timestamp ASC);`;
     await client.execute(createMessagesTable);
+
+    await client.execute(`
+        CREATE TABLE IF NOT EXISTS tempTable(
+            channelid text,
+            author text,
+            timestamp timestamp,
+            text text,
+            PRIMARY KEY ((channelid, author), timestamp)
+        ) WITH CLUSTERING ORDER BY (timestamp ASC)
+    `);
 }
 
 app.use(express.json());
@@ -208,7 +218,9 @@ app.put('/channels/:channelId/messages', async (req, res) => {
 
     const timestamp = new Date();
     const insertQuery = 'INSERT INTO messages(channelid, timestamp, author, text) VALUES(?, ?, ?, ?)';
+    const insertTempQuery = 'INSERT INTO tempTable(channelid, timestamp, author, text) VALUES(?, ?, ?, ?)';
     await client.execute(insertQuery, [channelId, timestamp, author, text], {prepare: true});
+    await client.execute(insertTempQuery, [channelId, timestamp, author, text], {prepare: true});
 
     res.status(201).json({
         message: "Message added."
@@ -219,31 +231,10 @@ app.get('/channels/:channelId/messages', async (req, res) => {
     const {channelId} = req.params;
     const {startAt, author} = req.query;
     const parsedStartAt = startAt ? new Date(startAt) : null;
-    let tempTableName;
     
     if(author){
-        tempTableName = `tempMessages${Date.now()}`;
-        await client.execute(`
-            CREATE TABLE ${tempTableName} (
-                channelid text,
-                author text,
-                timestamp timestamp,
-                text text,
-                PRIMARY KEY ((channelid, author), timestamp)
-            ) WITH CLUSTERING ORDER BY (timestamp ASC)
-        `);
-
         const selectQuery = 'SELECT channelid, author, timestamp, text FROM messages WHERE channelid = ?';
         const selectResult = await client.execute(selectQuery, [channelId], {prepare: true});
-
-        if(selectResult.rows.length > 0){
-            const queries = selectResult.rows.map(row => ({
-                query: `INSERT INTO ${tempTableName} (channelid, author, timestamp, text) VALUES (?, ?, ?, ?)`,
-                params: [row.channelid, row.author, row.timestamp, row.text]
-            }));
-
-            await client.batch(queries, {prepare: true});
-        }
 
         let query;
         let params;
@@ -251,7 +242,7 @@ app.get('/channels/:channelId/messages', async (req, res) => {
         if(parsedStartAt){
             query = `
                 SELECT timestamp, author, text 
-                FROM ${tempTableName}
+                FROM tempTable
                 WHERE channelid = ? 
                 AND author = ? 
                 AND timestamp >= ?
@@ -260,7 +251,7 @@ app.get('/channels/:channelId/messages', async (req, res) => {
         }else{
             query = `
                 SELECT timestamp, author, text 
-                FROM ${tempTableName}
+                FROM tempTable
                 WHERE channelid = ? 
                 AND author = ?
             `;
@@ -268,7 +259,7 @@ app.get('/channels/:channelId/messages', async (req, res) => {
         }
         const result = await client.execute(query, params, {prepare: true});
 
-        await client.execute(`DROP TABLE IF EXISTS ${tempTableName}`);
+        //await client.execute(`DROP TABLE IF EXISTS tempTable`);
 
         const messages = result.rows.map(row => ({
             text: row.text,
